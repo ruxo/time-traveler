@@ -1,0 +1,117 @@
+@startuml storage-model
+title Time Traveler — Storage model (Postgres / PGlite, after migration 5, 2026-11-07)
+hide circle
+skinparam linetype ortho
+
+legend right
+  |= Colour |= Meaning |
+  | <#F5C6C6> | removed: created by migrations 3–4, dropped by migration 5 |
+endlegend
+
+entity users {
+  * id : uuid <<PK>> = gen_random_uuid()
+  --
+  * oidc_sub : text <<UNIQUE>>
+  email : text
+  name : text
+  * hidden_builtins : text[] = '{}'
+  * created_at : timestamptz = now()
+  disabled_at : timestamptz   (migration 2)
+}
+
+entity activities {
+  * id : uuid <<PK>> = gen_random_uuid()
+  --
+  * user_id : uuid <<FK users, on delete cascade>>
+  * name : text
+  * color : text
+  * created_at : timestamptz = now()
+  deleted_at : timestamptz
+  --
+  index activities_user_idx (user_id)
+}
+activities "user_id" }o--|| users
+
+entity time_sessions {
+  * id : uuid <<PK>> = gen_random_uuid()
+  --
+  * user_id : uuid <<FK users, on delete cascade>>
+  * activity : text   (built-in key, or 'c:' || activities.id)
+  * started_at : timestamptz
+  ended_at : timestamptz
+  target_seconds : integer
+  --
+  check (ended_at is null or ended_at >= started_at)
+  index time_sessions_user_started_idx (user_id, started_at desc)
+  unique time_sessions_one_running (user_id) where ended_at is null
+}
+time_sessions "user_id" }o--|| users
+time_sessions "activity (text, no FK)" }o..o| activities
+
+entity auth_sessions {
+  * token_hash : text <<PK>>
+  --
+  * user_id : uuid <<FK users, on delete cascade>>
+  * csrf : text
+  * expires_at : timestamptz
+  --
+  index auth_sessions_user_idx (user_id)
+}
+auth_sessions "user_id" }o--|| users
+
+entity oidc_requests {
+  * state : text <<PK>>
+  --
+  * verifier : text
+  * nonce : text
+  * created_at : timestamptz = now()
+}
+
+entity admins {
+  * id : uuid <<PK>> = gen_random_uuid()
+  --
+  * username : text <<UNIQUE>>
+  * password_hash : text
+  * created_at : timestamptz = now()
+}
+
+entity admin_sessions {
+  * token_hash : text <<PK>>
+  --
+  * admin_id : uuid <<FK admins, on delete cascade>>
+  * csrf : text
+  * expires_at : timestamptz
+}
+admin_sessions "admin_id" }o--|| admins
+
+entity admin_setup_tokens {
+  * token_hash : text <<PK>>
+  --
+  * created_at : timestamptz = now()
+  * expires_at : timestamptz
+  used_at : timestamptz
+}
+
+entity schema_migrations {
+  * version : integer <<PK>>
+  --
+  * applied_at : timestamptz = now()
+}
+
+entity line_messages #F5C6C6 {
+  * id : bigserial <<PK>>
+  --
+  * line_user_id : text
+  * role : text  check in ('user','assistant')
+  * content : text
+  * created_at : timestamptz
+}
+
+entity app_settings #F5C6C6 {
+  * key : text <<PK>>
+  --
+  * value : text
+  * updated_at : timestamptz
+  updated_by : text
+}
+@enduml

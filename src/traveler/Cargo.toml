@@ -1,0 +1,47 @@
+[package]
+name = "traveler"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "traveler"
+path = "src/main.rs"
+
+# Versions and feature sets live in the root `[workspace.dependencies]`.
+[dependencies]
+rzlib-error = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+jiff = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+config = { workspace = true }
+mongodb = { workspace = true }
+bson = { workspace = true }
+uuid = { workspace = true }
+trait-variant = { workspace = true }
+jsonwebtoken = { workspace = true }
+url = { workspace = true }
+serde_urlencoded = { workspace = true }
+scrypt = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = { workspace = true }
+tempfile = { workspace = true }

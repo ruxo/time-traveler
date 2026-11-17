@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = ["src/traveler", "src/traveler-migrate"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+
+# Declared once here, with the reason beside each non-obvious one. A member names a dependency with
+# `workspace = true` and adds features only where it needs a different set. Versions follow
+# docs/design/design.adoc section 6; the gotchas are agent-memory's, verified there.
+[workspace.dependencies]
+# `http` gives nothing here beyond the status type; the crate is the error model: `errorinfo!`, `Outcome`.
+rzlib-error = { version = "0.1", features = ["json", "http"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# `rustls` selects aws-lc-rs and verifies against the platform trust store; the defaults other than TLS are
+# re-listed so `default-features = false` does not silently drop them. One TLS stack, no OpenSSL.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "charset", "http2", "system-proxy"] }
+# Named so the binary can install the crypto provider by name before the first TLS connection.
+rustls = "0.23"
+
+jiff = { version = "0.2", features = ["serde"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
+
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+http = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+config = { version = "0.15", features = ["toml", "convert-case"] }
+clap = { version = "4", features = ["derive"] }
+
+# `default-features = false` drops `rustls-tls`, which would compile ring beside aws-lc-rs. `compat-3-0-0`
+# carries `bson-2`; losing it resolves a second, incompatible copy of every BSON type.
+mongodb = { version = "3", default-features = false, features = ["compat-3-0-0", "rustls-tls-aws-lc", "dns-resolver"] }
+# mongodb 3.x depends on bson 2.x: "2" unifies with `mongodb::bson`, "3" would be a second copy.
+bson = { version = "2", features = ["uuid-1"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+trait-variant = "0.1"
+
+# RS256 verification of the identity provider's id_token against its JWKS; `aws_lc_rs` is the provider rustls
+# already brings, and with no provider feature 11.x panics on first use.
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+url = "2"
+serde_urlencoded = "0.7"
+
+# Node's `scrypt$N$r$p$salt$key` hashes, verified and produced with the same parameters. scrypt 0.12 uses
+# sha2 0.11, as does hmac 0.13: one copy of the hash.
+scrypt = { version = "0.12", default-features = false }
+hmac = "0.13"
+sha2 = "0.11"
+subtle = "2"
+rand = "0.9"
+base64 = "0.22"
+
+rust-embed = "8"
+mime_guess = "2"
+
+# Tests: `ServiceExt::oneshot` drives the router without a socket; `BodyExt::collect` reads a response.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

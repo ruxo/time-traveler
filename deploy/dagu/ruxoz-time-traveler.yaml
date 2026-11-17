@@ -1,0 +1,10 @@
+description: Build Time Traveler and deploy it to ruxoz.home
+shell: pwsh
+
+steps:
+  - call: build-n-deploy.yaml
+    params:
+      - WORK_DIR=C:/Workspace/Traveler
+      - CONTAINER_PATH=./src/traveler
+      - IMAGE_NAME=time-traveler
+      - HOST=ruxoz.home

@@ -1,0 +1,33 @@
+= Bylaws
+
+Time Traveler's own rules under the Constitution, `C:\Users\RZ\OneDrive\Knowledge\Computation\Design\Constitution.adoc`.
+A bylaw may narrow an article or record an accepted exception, never contradict one. "Article N" in Time Traveler's
+code and documents means the Constitution's article N; "bylaw N" means a rule below.
+
+Proposed 2026-11-07 with `docs/design/design.adoc`, revised and approved by Rux on 2026-11-08.
+
+== Bylaws
+
+1. Time Traveler pays no dependency for a caller's work: MongoDB Atlas and the Erawan auth add-on are charged to
+   the account, not per request. Article 1 has nothing to attribute here. (proposed; narrows article 1)
+2. Every request completes within 60 s: no single wait exceeds 5 s (a Mongo operation, a call to the identity
+   provider), Mongo's server selection is 10 s, and no request makes more than 9 such waits; the longest path,
+   a session start that loses the race twice, is named in design.adoc section 6. (proposed; narrows article 6,
+   100 s behind Cloudflare)
+3. The service runs no actor: every request is served on the request's own task and ends with its response; the
+   one background task, the startup index check, only logs. Articles 2 and 7 have nothing to govern. (proposed;
+   narrows articles 2 and 7)
+4. The wire model is the Node version's JSON, unchanged, so `public/` keeps working without a change; a field, a
+   route or an error code is added only where Node answered nothing a client reads, never altered. (proposed;
+   narrows article 10 to a fixed wire model)
+
+== Accepted exceptions
+
+1. Two devices creating a custom activity at the same instant can leave a user with 51 live activities. The cap
+   guards against runaway, not a contract, and serialising it costs a transaction or a counter document the value
+   does not justify. (proposed; article 11)
+2. A logout clears the browser that asked and no other device; the other devices' cookies live until they expire,
+   30 days at most. Revoking them costs a session collection and a read on every request, for a case nobody has
+   asked for; a disabled or deleted user is still cut off on the next request. (proposed; article 11)
+3. Disabling a user is two writes without a transaction: a crash between them leaves a disabled user with a running
+   session that nobody can touch until the user is enabled. (proposed; article 3)

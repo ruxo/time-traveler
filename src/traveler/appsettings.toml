@@ -1,0 +1,29 @@
+# Time Traveler's defaults (design section 7). Overlaid by `appsettings.{RUST_ENVIRONMENT}.toml` when that file
+# exists, then by environment variables: `__` nests (`MONGO__CONNECTION_STRING` is mongo.connection-string), and
+# the six AUTH_* names Erawan's auth add-on sets, PUBLIC_URL and PORT map by a fixed table in config.rs.
+#
+# Never here, from the environment — a missing one fails startup, by name:
+#   mongo.connection-string   MONGO__CONNECTION_STRING   the Atlas URI (an Erawan secret)
+#   session.key               SESSION__KEY               the HMAC key for the signed cookies, 32+ characters (a secret)
+#   auth.*                    AUTH_ISSUER_URL, AUTH_CLIENT_ID, AUTH_CLIENT_SECRET, AUTH_JWKS_URL, AUTH_WELLKNOWN_URL
+#   auth.public-url           PUBLIC_URL                 optional; builds the sign-in callback URL and the setup link
+
+bind-address = "0.0.0.0:8080"
+
+[mongo]
+database = "traveler"
+
+[session]
+# The member cookie, the admin cookie, the first admin's setup link, the OIDC handshake cookie.
+member-days  = 30
+admin-hours  = 12
+setup-hours  = 24
+oidc-minutes = 15
+
+[auth]
+# One-click local sign-in; `true` only in appsettings.development.toml, refused beside a configured provider.
+dev-login = false
+
+[logging]
+# An EnvFilter directive.
+level = "info"

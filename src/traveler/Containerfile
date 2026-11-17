@@ -1,0 +1,45 @@
+# Time Traveler's image. BUILD CONTEXT IS THE REPOSITORY ROOT, not this directory:
+#
+#     podman build -f src/traveler/Containerfile -t localhost/time-traveler:<git describe --tags> .
+#
+# The Dagu DAG `deploy/dagu/ruxoz-time-traveler.yaml` runs exactly that on ruxovo and ships the image to ruxoz.home.
+# The image is environment-neutral: the secrets come from `appsettings.production.toml`, mounted beside the binary
+# at run time (deploy/ruxoz.home/compose.yaml).
+
+# ---- build ----------------------------------------------------------------------------------
+FROM rust:1.96-slim-bookworm AS build
+WORKDIR /src
+
+# Every workspace member must be present, the migrate tool included: Cargo refuses a workspace whose member manifest
+# is missing. `public/` is embedded into the binary by rust-embed.
+COPY Cargo.toml Cargo.lock rustfmt.toml ./
+COPY src/traveler ./src/traveler
+COPY src/traveler-migrate ./src/traveler-migrate
+COPY public ./public
+
+# The cache mounts are not part of any layer, so the binary is copied out of `target` within the same RUN. The
+# target cache has its own id: by default buildah keys a cache by its path, and agent-memory's build uses the same
+# `/src/target`. The build host must exempt the caches from systemd-tmpfiles ageing, one line in
+# `/etc/tmpfiles.d/buildah-cache.conf` inside the Podman machine:  x /var/tmp/buildah-cache-*
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=time-traveler-target,target=/src/target \
+    cargo build --release --locked --package traveler \
+ && cp target/release/traveler /traveler
+
+# ---- runtime --------------------------------------------------------------------------------
+FROM debian:bookworm-slim
+
+# curl is for the compose health check.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=build /traveler /app/traveler
+# Read from the working directory at startup, then overlaid by appsettings.{RUST_ENVIRONMENT}.toml when mounted.
+COPY src/traveler/appsettings.toml /app/appsettings.toml
+
+EXPOSE 8080
+
+# Exec form: the binary is PID 1 and SIGTERM reaches its shutdown handler.
+ENTRYPOINT ["/app/traveler"]

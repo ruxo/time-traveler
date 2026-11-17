@@ -1,0 +1,47 @@
+﻿== Data Model
+
+[plantuml, svg]
+----
+@startuml
+hide empty members
+
+package app {
+  class User {
+    id: uuid
+    email: String?
+    name: String?
+    disabled: Timestamp?
+    created: Timestamp
+    updated: Timestamp
+  }
+
+  class Activity {
+    id: uuid
+    name: String
+    color: String
+  }
+
+  class TS as "TimeSession" {
+    id: uuid
+    activity: uuid
+    started_at: Timestamp
+    ended_at: Timestamp
+    target_seconds: i32?
+  }
+}
+
+package admin {
+  class Admin {
+    id: uuid
+    username: String
+    password: String
+    created: Timestamp
+    updated: Timestamp
+  }
+}
+
+User *-> TS
+TS -> Activity
+
+@enduml
+----

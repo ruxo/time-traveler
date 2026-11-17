@@ -1,0 +1,24 @@
+# The stanza for ruxoz.home's /data/services/docker-compose.yml, under `services:`, in that file's indentation.
+# No published port: nginx reaches the app as time-traveler:8080 on friend-network.
+# The settings overlay holds every secret; settings-template.toml names its keys.
+
+  time-traveler:
+    container_name: time-traveler
+    hostname: time-traveler
+    image: localhost/time-traveler:latest
+    restart: always
+    environment:
+      RUST_ENVIRONMENT: production
+    volumes:
+      - /data/apps/time-traveler/appsettings.production.toml:/app/appsettings.production.toml:ro
+    # In compose rather than the image: Podman builds OCI images, which drop HEALTHCHECK.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    # The limit it ran under on Erawan.
+    mem_limit: 256m
+    networks:
+    - friend-network

@@ -1,0 +1,127 @@
+@startuml domain-model
+title Time Traveler — Data as the code holds it today (pg rows + constants, 2026-11-07)
+hide empty members
+
+note as N0
+  There is no domain type layer. Every route reads
+  the pg row object as returned by `select *` and
+  tests nullable columns directly
+  (disabled_at, ended_at, deleted_at, used_at).
+  "?" marks a nullable column.
+end note
+
+package "Account" {
+  class User as "users row" {
+    id : uuid
+    oidc_sub : string
+    email : string?
+    name : string?
+    hidden_builtins : string[]
+    created_at : Date
+    disabled_at : Date?
+  }
+  User "hidden_builtins[]" --> "*" BUILTINS
+  User "activities.user_id" *--> "*" Activity
+  User "time_sessions.user_id" *--> "*" TimeSession
+  User "auth_sessions.user_id" *--> "*" AuthSession
+}
+
+package "Activities (src/activities.js)" {
+  class BUILTINS <<enum>> {
+    a const array of 8 strings
+  }
+  class sleep <<literal>>
+  class nap <<literal>>
+  class eat <<literal>>
+  class work <<literal>>
+  class rest <<literal>>
+  class game <<literal>>
+  class travel <<literal>>
+  class social <<literal>>
+  BUILTINS <|-- sleep
+  BUILTINS <|-- nap
+  BUILTINS <|-- eat
+  BUILTINS <|-- work
+  BUILTINS <|-- rest
+  BUILTINS <|-- game
+  BUILTINS <|-- travel
+  BUILTINS <|-- social
+
+  class CUSTOM_COLORS <<enum>> {
+    a const array of 6 hex strings
+  }
+
+  class Activity as "activities row" {
+    id : uuid
+    user_id : uuid
+    name : string
+    color : string
+    created_at : Date
+    deleted_at : Date?
+  }
+  Activity "color" --> CUSTOM_COLORS
+
+  class TimeSession as "time_sessions row" {
+    id : uuid
+    user_id : uuid
+    activity : string
+    started_at : Date
+    ended_at : Date?
+    target_seconds : number?
+  }
+  TimeSession "activity (when in BUILTINS)" ..> BUILTINS
+  TimeSession "activity (when 'c:' + id)" ..> Activity
+}
+
+package "Sign-in (src/auth.js)" {
+  class AuthSession as "auth_sessions row" {
+    token_hash : string
+    user_id : uuid
+    csrf : string
+    expires_at : Date
+  }
+  class OidcRequest as "oidc_requests row" {
+    state : string
+    verifier : string
+    nonce : string
+    created_at : Date
+  }
+  class PROVIDERS <<enum>> {
+    a const array of 3 strings
+  }
+  class google <<literal>>
+  class line <<literal>>
+  class emailProvider as "email" <<literal>>
+  PROVIDERS <|-- google
+  PROVIDERS <|-- line
+  PROVIDERS <|-- emailProvider
+}
+
+package "Administration (src/admin.js)" {
+  class Admin as "admins row" {
+    id : uuid
+    username : string
+    password_hash : string
+    created_at : Date
+  }
+  Admin "admin_sessions.admin_id" *--> "*" AdminSession
+
+  class AdminSession as "admin_sessions row" {
+    token_hash : string
+    admin_id : uuid
+    csrf : string
+    expires_at : Date
+  }
+  class SetupToken as "admin_setup_tokens row" {
+    token_hash : string
+    created_at : Date
+    expires_at : Date
+    used_at : Date?
+  }
+  class LoginFailure as "failures Map entry (in memory)" {
+    key : username
+    count : number
+    until : epoch ms
+  }
+}
+@enduml

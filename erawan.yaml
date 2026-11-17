@@ -1,0 +1,15 @@
+# Time Traveler on Erawan (design section 8). `postgres` is not declared: the Node version's add-on leaves the
+# app's environment on the deploy that ships this file and is removed with `erawan addon rm` after the cutover.
+version: 1
+addons: [auth]
+components:
+  web:
+    path: .
+    port: 8080
+    public: true
+    healthcheck: /healthz
+    # Set once in the Erawan console: the Atlas URI, and the HMAC key for the signed cookies (32+ characters).
+    secrets: [MONGO__CONNECTION_STRING, SESSION__KEY]
+    resources:
+      requests: {memory: 64Mi, cpu: 50m}
+      limits:   {memory: 256Mi, cpu: 500m}

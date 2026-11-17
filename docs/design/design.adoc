@@ -1,0 +1,801 @@
+= Time Traveler: Rust service design
+:toc:
+:toclevels: 2
+
+The Rust service that replaces `src/*.js`: a member records roughly how long each day goes to each activity, an admin operates the member list. The frontend in `public/` stays as it is, so every route answers the JSON the Node version answers today. Storage moves from the Erawan Postgres add-on to MongoDB Atlas; sign-in stays on the Erawan auth add-on. The service deploys on Erawan first and moves off it later, one step at a time.
+
+Rewritten 2026-11-08 against `src/*.js`, `public/app.js`, `public/admin/admin.js` and the crates named in section 6, and approved by Rux the same day. Decisions attributed to Rux are his; everything marked _proposed_ was mine and stands with that approval. Section 10 lists what was verified and what was not.
+
+== Decisions
+
+* Rust, modelled on `agent-memory` (Rux, 2026-11-07): Axum 0.8, Tokio, `rzlib-error`, `jiff`, `config`, `trait-variant`, the per-module clippy deny list and the model/storage/web split.
+* MongoDB Atlas now, not Postgres first (Rux, 2026-11-07). Cluster `default.ysnnrsq.mongodb.net`, Bangkok. The storage model is designed for Mongo, not carried over.
+* The domain model is Rux's (section 2.1). It has no `hidden` feature (Rux, 2026-11-07): `PUT /api/builtins/{key}` goes, `hiddenBuiltins` leaves `/api/state`, and `public/app.js` loses its hide toggle.
+* The nine predefined activities are static data, not a type: `Activity` values with fixed ids, held in code (Rux, 2026-11-07). `sport` joined the first eight on 2026-11-10: one entry in `activities::PREDEFINED_NAMES` and one in `BUILTIN`, `ICONS` and the two `act.sport` translations of `public/`; its id follows from its name, so no stored document changed.
+* The running session is application state, not a domain `TimeSession`: a domain `TimeSession` has ended (Rux, 2026-11-07).
+* _Proposed._ Sign-in state lives in HMAC-signed cookies, not in collections: the member session, the admin session and the OIDC handshake. Section 4 defines the format. What changes against Node: a logout clears the browser that asked, not every device; disable and delete still take effect on the next request, because every request loads the `User`.
+* The service runs as one instance (Rux, 2026-11-08), so the first admin's setup token and the login throttle are held in memory; no collection holds sign-in state of any kind. A restart while no admin exists prints a new setup link.
+* _Proposed._ One running session per user is kept by a partial unique index on a `Running: true` marker, because a partial index cannot filter on an absent field (`$exists: false` is not allowed in `partialFilterExpression`; equality is). `Running` is a derived value held for the index, written in the same operation as `EndedAt` (article 9).
+* _Proposed._ Starting a session is two writes with no transaction: end the running session and read its `EndedAt`, then insert the new one starting at that instant. A race loses on the unique index and retries. Only deleting a user runs a multi-document transaction.
+* The wire model is today's JSON (bylaw 4). A new code is added only where Node answered no JSON at all (`not_configured`, `method_not_allowed`) or a 500 for a malformed request (`bad_body`); a Mongo failure stays `server_error`.
+* Every model is its own type (article 10): domain `model.rs`, storage `storage.rs` (a document that converts to no valid domain value is refused), wire `web/*.rs`.
+
+== Data model
+
+=== Domain model
+
+[plantuml, domain-model, svg]
+----
+@startuml
+hide empty members
+
+package app {
+  class User {
+    id : Uuid
+    email : String?
+    name : String?
+    disabled : Timestamp?
+    created : Timestamp
+    updated : Timestamp
+  }
+  User "sessions" *--> "*" TimeSession
+
+  class Activity {
+    id : Uuid
+    name : String  -- 1..40 scalar values, no leading/trailing/double spaces
+    color : String  -- one of the 6 palette colours
+    icon : String  -- one of the 12 icons
+  }
+
+  class TS as "TimeSession" {
+    id : Uuid
+    activity : Uuid
+    started_at : Timestamp
+    ended_at : Timestamp  -- >= started_at
+    target_seconds : i32?  -- 60..=86400, a multiple of 60
+  }
+  TS "activity" --> Activity
+  note bottom of Activity : 9 predefined values are static data in code\n(sleep, nap, eat, work, rest, game, travel, social, sport);\nthe rest are stored, one owner each
+}
+
+package admin {
+  class Admin {
+    id : Uuid
+    username : String  -- [a-z0-9._-]{3,32}
+    password : PasswordHash  -- scrypt, section 2.5
+    created : Timestamp
+    updated : Timestamp
+  }
+}
+
+legend right
+  label at an arrow's start: the field that holds it
+endlegend
+@enduml
+----
+
+* `activities::PREDEFINED: [Activity; 9]`. Each id is `Uuid::new_v5(&NAMESPACE, name.as_bytes())` with one namespace UUID fixed in code, so the ids are stable and derivable, never typed by hand. `name` is the key the client translates (`sleep`, `nap`, …), `color` the colour `public/app.js` already assigns to that key. `PREDEFINED` is looked up by id and by name; nothing else distinguishes a predefined activity from a stored one. `activities::PALETTE: [&str; 6]` is `CUSTOM_COLORS` from `src/activities.js`.
+* `activities::ICONS: [&str; 12]` (`star`, `book`, `music`, `heart`, `code`, `cart`, `home`, `pencil`, `leaf`, `chat`, `camera`, `film`) are the icons a stored activity may take (Rux, 2026-11-11): keys of the drawings in `public/app.js`, in the same order as its `CUSTOM_ICONS`. `DEFAULT_ICON` is `star`, the one drawing every stored activity had before. A predefined activity's `icon` is its own name, the key the client already draws it by, and is outside this list as its colour is outside the palette.
+* `Timestamp` is `jiff::Timestamp`. Every instant the service writes is taken once per request (`Timestamp::now()` at the start of the facade call) and reused, as Node's one `now()` per transaction.
+* `Activity::new(name, color, icon)` normalises nothing: the web layer trims, collapses runs of whitespace to one space and refuses an empty or over-long name before the domain sees it; the constructor refuses what still violates the comment. `TimeSession::new` refuses `ended_at < started_at` and a target outside the range.
+* `PasswordHash` is a value type that parses and prints Node's `scrypt$N$r$p$salt$key` string and verifies a password against it (section 2.5).
+
+=== Application state
+
+What the service keeps beside the domain: who a user is to the identity provider, which session is running, which activity is gone, who is signed in. Types of their own in `model.rs`, so storage and the cookie codec each convert into exactly one type per shape.
+
+[plantuml, app-state, svg]
+----
+@startuml
+hide empty members
+
+class Identity {
+  issuer : String  -- the issuer URL, or "dev"
+  subject : String  -- the id_token's sub, or "local"
+}
+Identity "user" --> User
+note bottom of Identity : a User has 1 or more; (issuer, subject) is unique
+
+class Running {
+  id : Uuid  -- becomes the TimeSession's id when it ends
+  activity : Uuid
+  started_at : Timestamp
+  target_seconds : i32?
+}
+Running "user" --> "1" User
+note bottom of Running : at most one per User
+
+class Ownership {
+  created : Timestamp
+  deleted : Timestamp?  -- a deleted Activity keeps its name for past sessions
+}
+Ownership "activity" --> "1" Activity
+Ownership "user" --> "1" User
+note bottom of Ownership : every stored Activity has one;\na user has at most 50 with deleted absent
+
+class SetupToken {
+  token_hash : [u8; 32]  -- sha256 of the link's token
+  expires : Timestamp  -- 24 hours after start
+}
+note bottom of SetupToken : in memory only, at most one;\nexists only while no Admin exists; taken once
+
+class LoginThrottle {
+  failures : Map<String, (u32, Timestamp?)>  -- per username: count, locked until
+}
+note bottom of LoginThrottle : in memory only; 5 failures lock 15 minutes
+
+package "signed cookies (section 4)" {
+  class MemberSession {
+    user : Uuid
+    csrf : String
+    expires : Timestamp  -- 30 days
+  }
+  class AdminSession {
+    admin : Uuid
+    csrf : String
+    expires : Timestamp  -- 12 hours
+  }
+  class OidcHandshake {
+    state : String
+    verifier : String
+    nonce : String
+    expires : Timestamp  -- 15 minutes
+  }
+}
+
+legend right
+  label at an arrow's start: the field that holds it
+endlegend
+@enduml
+----
+
+* A user may start or relabel to a predefined activity, or to an `Activity` the user owns whose `Ownership.deleted` is absent. A deleted activity stays in `/api/state` with `deleted: true`, as today.
+* The 50 cap counts the user's activities with `deleted` absent; the default colour counts them all.
+* Deleting a user removes the user's activities and sessions, running one included. Disabling ends the running session and makes every later request of that user answer `not_signed_in`; the sign-in callback answers `/?login_error=disabled`.
+
+=== Database
+
+Database `traveler` on the Atlas cluster. Field names PascalCase; a `?` field is absent, not null, when it has no value. Ids are BSON UUID (binary subtype 4) through `bson::serde_helpers::uuid_1_as_binary` (feature `uuid-1`); timestamps are BSON `Date` (millisecond precision) through `timestamp_bson`, copied from agent-memory. Mongo enforces none of the references between collections; the service does.
+
+[plantuml, database-model, svg]
+----
+@startuml
+hide circle
+hide methods
+skinparam classAttributeIconSize 0
+
+package "Member" #E3F2FD {
+class User <<collection>> #BBDEFB {
+  _id : UUID  <<PK>>
+  Identities : Array<Identity>  -- 1 or more
+  Email : String?
+  Name : String?
+  DisabledAt : Date?
+  CreatedAt : Date
+  UpdatedAt : Date
+  .. indexes ..
+  { _id }
+  { Identities.Issuer : 1, Identities.Subject : 1 } unique  -- "Identity"
+}
+class Identity <<embedded>> #E3F2FD {
+  Issuer : String
+  Subject : String
+}
+class Activity <<collection>> #BBDEFB {
+  _id : UUID  <<PK>>
+  UserId : UUID
+  Name : String
+  Color : String
+  Icon : String?  -- absent on a document older than icons
+  CreatedAt : Date
+  DeletedAt : Date?
+  .. indexes ..
+  { _id }
+  { UserId : 1, CreatedAt : 1 }  -- "UserCreated"
+}
+class TimeSession <<collection>> #BBDEFB {
+  _id : UUID  <<PK>>
+  UserId : UUID
+  ActivityId : UUID  -- an Activity._id or a PREDEFINED id
+  StartedAt : Date
+  EndedAt : Date?  -- absent while running
+  Running : Boolean?  -- true while running, else absent
+  TargetSeconds : Int32?
+  .. indexes ..
+  { _id }
+  { UserId : 1, StartedAt : 1 }  -- "UserStarted"
+  { UserId : 1 } unique, partialFilterExpression { Running : true }  -- "OneRunning"
+}
+}
+
+package "Admin" #F3EEFF {
+class Admin <<collection>> #E6E0F8 {
+  _id : UUID  <<PK>>
+  Username : String
+  PasswordHash : String  -- scrypt$N$r$p$salt$key
+  CreatedAt : Date
+  UpdatedAt : Date
+  .. indexes ..
+  { _id }
+  { Username : 1 } unique  -- "Username"
+}
+}
+
+User *-- "1..*" Identity : Identities
+Activity::UserId --> User::_id
+TimeSession::UserId --> User::_id
+TimeSession::ActivityId ..> Activity::_id : a stored activity's
+
+legend right
+  blue: the member side; purple: the admin side
+  <<collection>> a collection; <<embedded>> a nested document
+  filled diamond: the field holds the embedded document
+  <<PK>> the document key; { … } an index, 1 ascending
+  solid arrow: holds while the referred document exists; dotted arrow: matched by value
+  ? absent when there is no value
+endlegend
+@enduml
+----
+
+* `OneRunning` is what keeps one running session per user, as Postgres' `time_sessions_one_running` did. `{ UserId: 1 }` with `partialFilterExpression: { Running: true }` indexes only the running documents, so a user has at most one. Stopping a session `$set`s `EndedAt` and `$unset`s `Running` in one update, so the two are never seen apart.
+* `Identity` is a compound index over two fields of one array, which Mongo allows (one array per compound index); unique means no two users share an (issuer, subject).
+* No TTL index: nothing stored expires.
+* Indexes are created by `traveler-migrate indexes` before the first deploy and after any change, never by the service. At startup the service lists each collection's indexes once, in the background, and logs each missing name at Error; it serves either way.
+* Document counts stay far under the Free cluster's limits (500 collections, 0.5 GB, 500 connections); the driver's pool is left at its default of 10 connections maximum.
+
+=== Storage conversions
+
+`storage.rs` holds one `serde` record per collection (`UserRecord`, `ActivityRecord`, `TimeSessionRecord`, `AdminRecord`), `From<&Domain>` into a record and `TryFrom<Record>` out of it. A record that converts to no valid value is refused: the read fails with code `corrupt_document`, logged at Error with the collection and `_id`, and the request answers 500 `server_error` (article 10; the data is repaired by hand, article 3).
+
+[cols="1,2"]
+|===
+| Record | Converts to, or is refused when
+
+| `UserRecord` | `User` + `Vec<Identity>`; refused when `Identities` is empty
+| `ActivityRecord` | `Activity` + `Ownership`; refused when `Name` is not 1..40 scalar values, `Color` is not in the palette or `Icon` is not one of the icons; an absent `Icon` reads as `star`, so the documents written before icons need no migration, and a write always stores the icon
+| `TimeSessionRecord` with `EndedAt` present and `Running` absent | `TimeSession` + owner; refused when `EndedAt < StartedAt` or `TargetSeconds` is outside `60..=86400`
+| `TimeSessionRecord` with `EndedAt` absent and `Running: true` | `Running` + owner; same `TargetSeconds` rule
+| `TimeSessionRecord` in any other combination | refused
+| `AdminRecord` | `Admin`; refused when `Username` fails the pattern or `PasswordHash` does not parse (section 2.5)
+|===
+
+Migrated data has one known deviation: the Node version stored `target_seconds` as `targetMinutes * 60` with minutes in `1..=1440`, which is inside the range, and `activities.name` was trimmed and collapsed on the way in, so no existing row is expected to be refused. The import tool reports every refused row by table and id and writes nothing when any is refused (section 9).
+
+=== Password hashes
+
+Node's `admin.js` hashes with `crypto.scrypt(password, salt16, 64, { N: 16384, r: 8, p: 1 })` and stores `scrypt$16384$8$1$<salt base64>$<key base64>`. The Rust `PasswordHash`:
+
+* parses the string into `N`, `r`, `p`, salt bytes and key bytes; refuses a `kind` other than `scrypt`, an `N` that is not a power of two, or an unparsable base64;
+* verifies with `scrypt::scrypt(password, &salt, &Params::new(log2(N), r, p)?, &mut out)` where `out.len() == key.len()` (scrypt 0.12: `Params::new(log_n: u8, r: u32, p: u32)`; the output length comes from the buffer), then compares `out` with the stored key in constant time (`subtle::ConstantTimeEq`);
+* hashes a new password with the same parameters (`log_n` 14, `r` 8, `p` 1, 16 random salt bytes, 64-byte key) and prints the same string, so the migrated admin signs in unchanged and a hash made by either version verifies in the other.
+
+Password length is counted in UTF-16 code units (`password.encode_utf16().count()`), which is what JavaScript's `.length` counted, so the same passwords pass `10..=200` in both versions.
+
+== Wire model
+
+Today's JSON, as `public/app.js` and `public/admin/admin.js` read it. The one removed route is `PUT /api/builtins/{key}`, with `hiddenBuiltins` leaving `GET /api/state`; `public/app.js` loses `toggle-builtin`, `state.hidden` and the hide buttons in the same change.
+
+An activity on the wire is a string key: a predefined activity is its name (`sleep`), a stored one is `c:` + its UUID in lowercase hyphenated form. `web/keys.rs` converts both ways: key → `Uuid` through `PREDEFINED` by name, or the `c:` prefix followed by exactly the 8-4-4-4-12 hexadecimal form (case-insensitive, as Node's regex); `Uuid` → key through `PREDEFINED` by id, or the prefix. Session ids and user ids on the wire are UUIDs in the same form; a path id in any other form answers 404 `not_found`, as Node's `isUuid` did.
+
+Timestamps on the wire are UTC with exactly three fractional digits and a `Z` (`2026-11-08T03:04:05.678Z`), formatted with jiff's `%Y-%m-%dT%H:%M:%S%.3fZ`, which is what `Date.prototype.toISOString` produced. BSON `Date` carries milliseconds, so nothing is lost.
+
+=== Routes
+
+Every member route after `/api/config` requires the member cookie; every non-GET among them requires `X-CSRF-Token`. Every admin route after `/admin/api/login` requires the admin cookie, and every non-GET among them the CSRF header. Request bodies are JSON, at most 16 KiB.
+
+[cols="2,3,2,3"]
+|===
+| Route | What it is for | Reads | Answers
+
+| `GET /healthz` | Erawan's readiness probe: is the service up and can it reach the database | | `{ok: true}`; 503 `{ok: false}` when `ping` on the database fails or takes over 5 s
+| `GET /api/config` | The login page asks which sign-in buttons to show before anyone is signed in | | `{providers: ["google","line","email"]}` when `auth` is configured, else `[]`; `devLogin: bool`
+| `GET /api/me` | Who is signed in, and the CSRF token the client must echo on every write | cookie | `{name, email, csrf}`, `name` and `email` null when absent
+| `GET /api/state` | Everything the home screen needs besides today's list: the server clock (to correct the device's), the user's custom activities, and the session running now | cookie | `{serverNow, custom: [ActivityView], current: SessionView or null}`; `custom` in `CreatedAt` order, deleted ones included
+| `GET /api/sessions?from&to` | The sessions that touch one day: the client sends the day's start and the next day's start, and gets every session overlapping that window, the running one included | cookie; two timestamps | `{serverNow, sessions: [SessionView]}` in `StartedAt` order: every session with `StartedAt < to` and (running or `EndedAt > from`); 400 `bad_range` unless both parse, `from < to` and `to - from <= 3 days`
+| `POST /api/sessions/start` | Start doing an activity now, with an optional target length; whatever was running ends at this instant, unless it already is this activity, which then goes on as the same session with the new target | `{activity, targetMinutes?}` | 201 `{current: SessionView}`; 400 `bad_target`, `bad_activity`
+| `POST /api/sessions/stop` | Stop the running session now, if there is one | | `{stopped: SessionView or null}`
+| `PATCH /api/sessions/{id}` | Relabel a session, running or ended, to another activity; its times stay | `{activity}` | `{session: SessionView}`; 400 `bad_activity`; 404 `not_found`
+| `DELETE /api/sessions/{id}` | Remove an ended session from the record; the running one must be stopped first | | `{deleted: id}`; 409 `running`; 404 `not_found`
+| `POST /api/activities` | Add a custom activity with a name and, optionally, a palette colour and an icon; one off the palette or off the icon list takes the default; at most 50 live ones | `{name, color?, icon?}` | 201 `{activity: ActivityView}` with `deleted: false`; 400 `bad_name`; 409 `too_many`
+| `DELETE /api/activities/{key}` | Retire a custom activity: it leaves the picker but keeps its name on past sessions | | `{ok: true}`; 404 `not_found` unless the key is `c:` + UUID of a live activity of this user
+| `DELETE /api/account` | The member erases their own account and every session and activity in it | | `{ok: true}`, member cookie cleared
+| `GET /auth/login?provider` | The sign-in button's target: starts the OIDC flow with the chosen provider (`google`, `line`, `email`) hinted to Erawan auth | | 302 to the authorization endpoint, OIDC cookie set; 404 `not_configured` when `auth` is not configured
+| `GET /auth/callback?code&state` | Where Erawan auth sends the browser back; exchanges the code, finds or creates the user, signs them in | OIDC cookie | 302 `/` with the member cookie set and the OIDC cookie cleared; on any failure 302 `/?login_error=1`, or `/?login_error=disabled` for a disabled user, OIDC cookie cleared
+| `POST /auth/dev-login` | One-click sign-in as a fixed local user, for development only | | `{ok: true}`, member cookie set; 404 `not_found` unless `auth.dev-login`; 403 `disabled`
+| `POST /auth/logout` | Sign this browser out | cookie, CSRF | `{ok: true}`, member cookie cleared
+| `GET /admin/api/status` | The admin page asks which screen to show: first-time setup, login, or the user list; also carries the admin's CSRF token | admin cookie if any | `{needsSetup, signedIn, username, csrf}`; `username` and `csrf` null when not signed in
+| `POST /admin/api/setup` | Create the first and only admin, with the one-time token from the link the service logged at startup | `{token, username, password}` | 201 `{ok: true}`, admin cookie set; 400 `bad_username`, `bad_password`; 409 `already_set_up`; 403 `bad_token`
+| `POST /admin/api/login` | Admin sign-in with username and password; five failures lock the name for 15 minutes | `{username, password}` | `{ok: true}`, admin cookie set; 401 `bad_credentials`; 429 `{error: "locked", retryAfterSeconds}`
+| `POST /admin/api/logout` | Sign the admin's browser out | CSRF | `{ok: true}`, admin cookie cleared
+| `GET /admin/api/users` | The member list, newest first, with each member's last activity and session count | | `{users: [UserView]}` in `CreatedAt` descending order
+| `POST /admin/api/users/{id}/disable` | Lock a member out: they cannot sign in or call the API, and their running session ends now; their data stays | | `{user: UserView}`; 404 `not_found`
+| `POST /admin/api/users/{id}/enable` | Lift the lock | | `{user: UserView}`; 404 `not_found`
+| `DELETE /admin/api/users/{id}` | Erase a member and everything they recorded | | `{ok: true}`; 404 `not_found`
+|===
+
+Views, with `null` where Node sent null:
+
+* `SessionView`: `{id, activity, startedAt, endedAt, targetSeconds}`; `endedAt` null for the running session, `targetSeconds` null when none.
+* `ActivityView`: `{key, name, color, icon, deleted}` (`icon` added 2026-11-11, a field Node never answered, so bylaw 4 holds).
+* `UserView`: `{id, name, email, createdAt, disabled, disabledAt, lastActive, sessionCount}`; `disabled` is `disabledAt != null`; `lastActive` the greatest `StartedAt` of the user's sessions or null; `sessionCount` their count. Both come from one aggregation over `TimeSession` (`$match` the user ids, `$group` by `UserId` with `$max` and `$sum`), never stored (article 9).
+
+Request validation, exactly as `api.js` and `admin.js` do it:
+
+[cols="1,3"]
+|===
+| Field | Rule
+
+| `targetMinutes` | absent, `null` or `0` → no target; otherwise a JSON integer in `1..=1440`, stored as seconds × 60; anything else → `bad_target`
+| `activity` | a string that is a predefined name, or `c:` + UUID of a live activity of this user → else `bad_activity`
+| `name` | a string, trimmed, runs of whitespace collapsed to one space; then 1..=40 Unicode scalar values → else `bad_name`
+| `color` | used when it is one of the 6 palette strings; otherwise the palette entry at `(count of the user's activities, deleted included) mod 6`
+| `from`, `to` | RFC 3339 timestamps with an offset or `Z`; the frontend sends `toISOString()` output
+| `username` | trimmed, lowercased, then `^[a-z0-9._-]{3,32}$` → else `bad_username`
+| `password` | 10..=200 UTF-16 code units → else `bad_password`; on login a password over 200 is simply wrong
+| `token` | the string from the setup link's fragment; anything else behaves as an unknown token
+| a body that is not JSON or not the expected shape | 400 `bad_body` (Node answered its 500 `server_error` page here; no client sends one)
+|===
+
+=== Errors
+
+Every error answers `{error: <code>}`, plus `retryAfterSeconds` on `locked`:
+
+[cols="1,1,3"]
+|===
+| Status | Codes | Source
+
+| 400 | `bad_range` `bad_target` `bad_activity` `bad_name` `bad_username` `bad_password` `bad_body` | request validation
+| 401 | `not_signed_in` `bad_credentials` | no or invalid cookie; wrong admin password
+| 403 | `bad_csrf` `bad_token` `disabled` | CSRF header mismatch; setup token unknown, used or expired; dev-login of a disabled user
+| 404 | `not_found` `not_configured` | unknown route, id or key; sign-in without `auth` settings
+| 405 | `method_not_allowed` | a known path with another method (new; Node answered Express's HTML page)
+| 409 | `running` `too_many` `already_set_up` | delete of the running session; 51st live activity; setup after an admin exists
+| 429 | `locked` | 5 failed admin logins within the lock window
+| 500 | `server_error` | a driver error or a 5 s timeout on a Mongo call (inside: `database`), a refused document (`corrupt_document`), any other defect; the inner code is logged, the wire sees `server_error` as it did from Node
+| 503 | | `/healthz` only, with `{ok: false}`
+|===
+
+Inside the service every refusal is an `rzlib-error` `ErrorInfo` whose code is the wire code; `web/errors.rs` maps code to status in one `status_of` table, as agent-memory does, and logs the location trail, which never reaches the wire.
+
+=== Cookies, CSRF, headers
+
+* Cookie names: `__Host-tt_sid`, `__Host-tt_admin`, `__Host-tt_oidc` when the request is https, `tt_sid`, `tt_admin`, `tt_oidc` on plain http (local development). Attributes `HttpOnly; SameSite=Lax; Path=/`, `Secure` on https, `Max-Age` 30 days / 12 hours / 15 minutes, never `Domain` (Erawan's gate refuses a domain-scoped cookie, and the shared `erawan.app` domain is why). Clearing sets the same name with `Max-Age=0`.
+* The request is https when `X-Forwarded-Proto` is `https` (Erawan terminates TLS; Node had `trust proxy`), else when the listener itself is TLS, which it never is here.
+* Every state-changing request carries `X-CSRF-Token` equal to the `csrf` inside the signed cookie, compared in constant time (`subtle`). SameSite alone is not enough on the shared domain.
+* Every response carries the headers `server.js` sets: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`. One middleware adds them to every response, redirects and errors included.
+
+=== Static files
+
+`public/` is embedded with `rust-embed` 8 (`#[folder = "public/"]`; in a debug build it reads the directory, in release it is in the binary). `GET /` serves `index.html`; `GET /admin/` serves `admin/index.html`; `GET /admin` answers 301 `/admin/` as `express.static` did; any other path serves the file of that name or 404 `not_found`. Each file answers `Content-Type` from its extension, `ETag` from rust-embed's SHA-256 of the content, `Cache-Control: public, max-age=0` (Node's `maxAge: 0`), and 304 on a matching `If-None-Match`, so a deploy never mixes old and new modules.
+
+== Signed cookies
+
+One codec in `web/cookies.rs`, keyed by `session.key` (section 7), signs three payloads. A cookie value is
+
+----
+base64url(payload) "." base64url(HMAC-SHA256(key, payload))
+----
+
+without padding, and `payload` is UTF-8 text with fields joined by `|` (no field can contain `|`: UUIDs, decimal digits and base64url only):
+
+[cols="1,3,1"]
+|===
+| Kind | Payload | Life
+
+| member | `m\|<user UUID>\|<expires, Unix seconds>\|<csrf: 24 random bytes base64url>` | 30 days
+| admin | `a\|<admin UUID>\|<expires>\|<csrf>` | 12 hours
+| OIDC | `o\|<state: 32 random bytes b64url>\|<verifier: 32 random bytes b64url>\|<nonce: 16 random bytes b64url>\|<expires>` | 15 minutes
+|===
+
+Reading a cookie: split at the last `.`, decode both halves, verify the tag with `hmac`'s `verify_slice` (constant time), parse the payload, check the kind letter and `expires > now`. Any failure makes the request anonymous; nothing distinguishes a forged cookie from an expired one on the wire. The kind letter keeps a member cookie from being replayed as an admin cookie. A value is about 130 bytes for member and admin cookies, about 190 for the OIDC one.
+
+`session.key` is a string of at least 32 characters; its UTF-8 bytes are the HMAC key. Changing it signs everyone out. It is an Erawan secret like the Mongo URI.
+
+What the signed cookie does not give, and the design accepts (_proposed_, article 11): a logout that revokes other devices (Node deleted the row; here each device keeps its cookie until it expires or the user is disabled). A disabled or deleted user is still cut off on the next request, since every request loads the `User` by the cookie's id and refuses when it is missing or has `DisabledAt`.
+
+== Flows
+
+Colours: activation `#D6EAF8` (light blue) is a member's request being served; `#E6E0F8` (lavender) an admin's. A `group` box in `#E5E7E9` (grey) is one Mongo transaction. Every Mongo call below is one driver call bounded by a 5 s `tokio::time::timeout`; every call to the identity provider is a `reqwest` call with a 5 s timeout.
+
+=== Sign-in and the request that follows
+
+[plantuml, sign-in, svg]
+----
+@startuml
+actor "Member\n(browser)" as M
+participant "web/auth.rs" as A
+participant "auth.erawan.cloud" as E
+database "Atlas" as DB
+
+M -> A : GET /auth/login?provider=google
+activate A #D6EAF8
+A -> E : GET /.well-known/openid-configuration (first call per process; cached after)
+activate E #D6EAF8
+E --> A : issuer, authorization_endpoint, token_endpoint, jwks_uri
+deactivate E
+A -> E : GET jwks_uri (with the discovery, cached after)
+activate E #D6EAF8
+E --> A : keys
+deactivate E
+A -> A : state, verifier, nonce = random;\ncookie = sign(o|state|verifier|nonce|now+15 min)
+A --> M : 302 authorization_endpoint?response_type=code&client_id&redirect_uri\n&scope=openid email profile&state&nonce&code_challenge=S256(verifier)\n&code_challenge_method=S256&idp_hint=google\nSet-Cookie tt_oidc
+deactivate A
+
+M -> E : signs in at the provider
+activate E #D6EAF8
+E --> M : 302 /auth/callback?code&state
+deactivate E
+
+M -> A : GET /auth/callback?code&state  Cookie tt_oidc
+activate A #D6EAF8
+A -> A : verify cookie; cookie.state == query state;\nelse 302 /?login_error=1
+A -> E : POST token_endpoint\n(grant_type=authorization_code, code, redirect_uri,\nclient_id, client_secret, code_verifier) as form
+activate E #D6EAF8
+E --> A : { id_token }
+deactivate E
+A -> A : decode header kid → key from the cached JWKS\n(unknown kid: fetch jwks_uri once more);\nvalidate RS256, iss == issuer, aud == client_id, exp;\nclaims.nonce == cookie.nonce; else /?login_error=1
+A -> DB : findOneAndUpdate User\n{ Identities: { $elemMatch: { Issuer, Subject: sub } } }\n$set Email, Name (each only when the token carries it), UpdatedAt\n$setOnInsert _id: new, Identities: [{Issuer, Subject}], CreatedAt\nupsert, return after
+activate DB #D6EAF8
+DB --> A : User
+deactivate DB
+A -> A : DisabledAt present → 302 /?login_error=disabled
+A --> M : 302 /\nSet-Cookie tt_sid = sign(m|user|now+30 d|csrf)\nSet-Cookie tt_oidc cleared
+deactivate A
+
+M -> A : GET /api/me  Cookie tt_sid
+activate A #D6EAF8
+A -> A : verify cookie → user id, csrf
+A -> DB : findOne User { _id }
+activate DB #D6EAF8
+DB --> A : User | none or DisabledAt → 401 not_signed_in
+deactivate DB
+A --> M : 200 { name, email, csrf }
+deactivate A
+@enduml
+----
+
+* The provider's discovery document (fetched 2026-11-08) names `authorization_endpoint` `https://auth.erawan.cloud/oauth2/auth`, `token_endpoint` `/oauth2/token`, `jwks_uri` `/.well-known/jwks.json`, signing algorithm `RS256` only, `client_secret_post` among the token auth methods, `S256` among the challenge methods, and `sub` as its only supported claim. The request keeps Node's `scope=openid email profile`; `email` and `name` are taken when the token carries them and left absent otherwise, which is also what Node did.
+* `redirect_uri` is `auth.public-url` + `/auth/callback` when set, else the request's scheme (section 3.3) and `Host` header; the same value is sent to the token endpoint.
+* An upsert racing another first sign-in of the same identity hits the `Identity` unique index; the callback retries the `findOneAndUpdate` once, which then finds the document.
+* The development sign-in (`POST /auth/dev-login`) runs the same upsert with identity `{ Issuer: "dev", Subject: "local" }`, email `dev@localhost`, name `Dev User`, and sets the member cookie.
+* Every member request runs the tail of the diagram: cookie → `User` by id → refuse when missing or disabled. One read; Node's join of two tables is gone.
+
+=== Start a session
+
+[plantuml, start-session, svg]
+----
+@startuml
+actor "Member\n(browser)" as M
+participant "web/api.rs" as A
+participant "facade.rs" as F
+database "Atlas" as DB
+
+M -> A : POST /api/sessions/start { activity: "sleep" | "c:…", targetMinutes? }\nX-CSRF-Token
+activate A #D6EAF8
+A -> A : key → Uuid (bad_activity if neither form);\ntargetMinutes → seconds or none (bad_target)
+A -> F : start(user, activity: Uuid, target_seconds)
+activate F #D6EAF8
+F -> F : now = Timestamp::now()
+F -> DB : usable? PREDEFINED holds the id, or\nfindOne Activity { _id, UserId, DeletedAt: { $exists: false } }
+activate DB #D6EAF8
+DB --> F : found | none → bad_activity
+deactivate DB
+F -> DB : findOneAndUpdate TimeSession { UserId, Running: true, ActivityId }\nset TargetSeconds; return after
+activate DB #D6EAF8
+DB --> F : none (nothing runs, or another activity does)
+deactivate DB
+F -> DB : findOneAndUpdate TimeSession { UserId, Running: true }\n$set EndedAt: now, $unset Running; return after
+activate DB #D6EAF8
+DB --> F : ended document | none
+deactivate DB
+F -> F : started_at = ended.EndedAt when one ended, else now
+F -> DB : insertOne TimeSession { _id: new, UserId, ActivityId,\nStartedAt: started_at, Running: true, TargetSeconds? }
+activate DB #D6EAF8
+DB --> F : ok
+deactivate DB
+F --> A : Running
+deactivate F
+A --> M : 201 { current: SessionView }
+deactivate A
+@enduml
+----
+
+The previous session ends at the instant the new one starts, as Node's single `now()` gave, and no document can hold `EndedAt < StartedAt`: the new `StartedAt` is the `EndedAt` just written.
+
+A start of the activity that already runs would make a second session beginning exactly where the first ends. The two are one stretch of the same activity, so the running session goes on instead (Rux, 2026-11-10):
+
+[plantuml, start-same-activity, svg]
+----
+@startuml
+actor "Member\n(browser)" as M
+participant "web/api.rs" as A
+participant "facade.rs" as F
+database "Atlas" as DB
+
+M -> A : POST /api/sessions/start { activity: "sleep", targetMinutes: 10 }\nwhile sleep runs since 100 s
+activate A #D6EAF8
+A -> F : start(user, sleep, 600)
+activate F #D6EAF8
+F -> DB : usable? (as above)
+activate DB #D6EAF8
+DB --> F : found
+deactivate DB
+F -> DB : findOneAndUpdate TimeSession { UserId, Running: true, ActivityId: sleep,\nStartedAt: { $gte: now - (86400 - 600) s } }\n[ { $set: { TargetSeconds: whole seconds from StartedAt to now + 600 } } ]; return after
+activate DB #D6EAF8
+DB --> F : the running document: same _id and StartedAt, TargetSeconds: 700
+deactivate DB
+F --> A : Running
+deactivate F
+A --> M : 201 { current: SessionView } (same id, same startedAt)
+deactivate A
+@enduml
+----
+
+* One driver call decides and writes: the filter matches only a running session of this activity, so nothing can change between the check and the update. No match falls through to the end-and-insert path above.
+* A target is counted from `StartedAt` (the client's reminder fires when the elapsed time passes it), so a target chosen now is stored as the whole seconds already run plus the new target; the reminder then fires the chosen time after the press. A start without a target removes the target (`$unset`), as a new session without one had none.
+* A stored target may not pass 86 400 s (a read refuses it), so the filter also requires `StartedAt >= now - (86400 - target) s`. A session too old for the new target does not match, and the request ends it and inserts a new one as before.
+* The answer stays `201`, nothing on the wire changes (bylaw 4).
+* The radial menu on the timer card's + button (Rux, 2026-11-11) is frontend only: a press on one of its icons sends this same request with `targetMinutes: null`, so a switch from the ring carries no reminder. The ring shows the other activities, predefined first, up to 10; the rest are reached through the start card, which a second press on + opens.
+* Not merged: a stop followed later by a start of the same activity (the times do not join), two stored back-to-back sessions made equal by a relabel, and two devices starting the same activity in the same instant with nothing running, where the loser of the insert race ends the winner's session and starts its own.
+
+Two devices starting at once:
+
+[plantuml, start-race, svg]
+----
+@startuml
+actor "Device A" as A
+actor "Device B" as B
+participant "facade.rs\n(request A's task)" as FA
+participant "facade.rs\n(request B's task)" as FB
+database "Atlas" as DB
+
+A -> FA : start(user, sleep)
+activate FA #D6EAF8
+B -> FB : start(user, work)
+activate FB #AED6F1
+FA -> DB : findOneAndUpdate { UserId, Running: true } $set EndedAt: nowA
+activate DB #D6EAF8
+DB --> FA : none (nothing was running)
+deactivate DB
+FB -> DB : findOneAndUpdate { UserId, Running: true } $set EndedAt: nowB
+activate DB #AED6F1
+DB --> FB : none
+deactivate DB
+FA -> DB : insertOne { Running: true, StartedAt: nowA }
+activate DB #D6EAF8
+DB --> FA : ok
+deactivate DB
+FA --> A : Running(sleep)
+deactivate FA
+FB -> DB : insertOne { Running: true, StartedAt: nowB }
+activate DB #AED6F1
+DB --> FB : E11000 duplicate key on OneRunning
+deactivate DB
+FB -> FB : attempt 2 of 3, nowB' = Timestamp::now()
+FB -> DB : findOneAndUpdate { UserId, Running: true } $set EndedAt: nowB'
+activate DB #AED6F1
+DB --> FB : A's session, EndedAt: nowB'
+deactivate DB
+FB -> DB : insertOne { Running: true, StartedAt: nowB' }
+activate DB #AED6F1
+DB --> FB : ok
+deactivate DB
+FB --> B : Running(work)
+deactivate FB
+@enduml
+----
+
+Colours here: `#D6EAF8` device A's request, `#AED6F1` device B's; each request runs on its own Tokio task, drawn as its own participant. The outcome is what Node's row lock produced: A's session exists, ended at the instant B's starts. The retry takes a fresh `now`; after 3 duplicate-key failures the request answers 500 `server_error`, the inner code `database` logged.
+
+Other session operations, each one driver call after the usability check where one is needed:
+
+* stop: `findOneAndUpdate { UserId, Running: true } $set EndedAt: now, $unset Running`, return after; `stopped` is the document or null.
+* relabel: `findOneAndUpdate { _id, UserId } $set ActivityId`, return after; none → `not_found`. Running or ended alike, as Node allowed.
+* delete: `findOneAndDelete { _id, UserId, EndedAt: { $exists: true } }`; none → `findOne { _id, UserId }` to tell `running` (409) from `not_found` (404).
+* list: `find { UserId, StartedAt: { $lt: to }, $or: [ { Running: true }, { EndedAt: { $gt: from } } ] }` sorted by `StartedAt`, on the `UserStarted` index.
+* state: `find Activity { UserId }` sorted by `CreatedAt` and `findOne TimeSession { UserId, Running: true }`, in parallel (`tokio::join!`).
+* create activity: `countDocuments { UserId, DeletedAt: { $exists: false } }` → 50 or more is `too_many`; `countDocuments { UserId }` for the default colour; `insertOne`. No transaction: two devices creating at the same instant can leave 51 (accepted exception 1 in the Bylaws).
+* delete activity: `findOneAndUpdate { _id, UserId, DeletedAt: { $exists: false } } $set DeletedAt: now`; none → `not_found`.
+
+=== Admin: setup, login, users
+
+* The first admin: at startup, when `countDocuments Admin` is 0, the service draws 32 random bytes, keeps `SetupToken { token_hash: sha256(token), expires: now + 24 h }` in a `std::sync::Mutex<Option<SetupToken>>` on the facade, and logs the link once at Info: `<public url>/admin/#setup=<token>`. The token is in the fragment, so no request log sees it. `POST /admin/api/setup` validates the credentials, hashes the password (section 2.5), then: `countDocuments Admin` > 0 → `already_set_up`; lock the mutex, compare `sha256(token)` with the held hash in constant time and check `expires > now`, and on a match `take()` the token out of the `Option` → no match → `bad_token`; `insertOne Admin`; the cookie is set. The `take()` under the lock is the single-use step: of two concurrent setups with the one link, one takes the token and inserts, the other gets `bad_token`. If the insert then fails, the token is put back so the link still works. One instance (decisions), so the memory is the only copy; a restart before setup logs a new link, and the old one stops working.
+* Login: the throttle is checked first (`locked` 429 with the remaining seconds, rounded up); then `findOne Admin { Username }`; when found, verify the hash, else hash a fixed filler so the time taken does not reveal which names exist; a failure records one against the username, the fifth locks it for 15 minutes; a success clears the username's record and sets the admin cookie.
+* The user list: `find User` sorted by `CreatedAt` descending, then one aggregation over `TimeSession` for `lastActive` and `sessionCount` of every user, joined in code. One user's view runs the same aggregation with `$match: { UserId }`.
+* Disable: `findOneAndUpdate User { _id } [ { $set: { DisabledAt: { $ifNull: ["$DisabledAt", now] }, UpdatedAt: now } } ]` (a pipeline update keeps an earlier `DisabledAt`, as Node's `coalesce` did), none → `not_found`; then `findOneAndUpdate TimeSession { UserId, Running: true } $set EndedAt: now, $unset Running`. Two writes, this order, no transaction: a crash between them leaves a disabled user with a running session, which the user cannot touch and the enable leaves running; accepted (article 3).
+* Enable: `findOneAndUpdate User { _id } $unset DisabledAt, $set UpdatedAt`, none → `not_found`.
+
+=== Delete a user
+
+[plantuml, delete-user, svg]
+----
+@startuml
+actor "Admin\n(browser)" as Ad
+participant "web/admin.rs" as W
+participant "facade.rs" as F
+database "Atlas" as DB
+
+Ad -> W : DELETE /admin/api/users/{id}  Cookie tt_admin, X-CSRF-Token
+activate W #E6E0F8
+W -> W : verify cookie → admin id, csrf; header == csrf
+W -> DB : findOne Admin { _id }
+activate DB #E6E0F8
+DB --> W : Admin | none → 401 not_signed_in
+deactivate DB
+W -> F : delete_user(id)
+activate F #E6E0F8
+F -> DB : startSession, startTransaction
+activate DB #E6E0F8
+DB --> F : session
+deactivate DB
+group#555555 #E5E7E9 one transaction
+F -> DB : deleteMany TimeSession { UserId }
+activate DB #E6E0F8
+DB --> F : n
+deactivate DB
+F -> DB : deleteMany Activity { UserId }
+activate DB #E6E0F8
+DB --> F : n
+deactivate DB
+F -> DB : deleteOne User { _id }
+activate DB #E6E0F8
+DB --> F : deleted 0 or 1
+deactivate DB
+F -> DB : commitTransaction
+activate DB #E6E0F8
+DB --> F : ok | TransientTransactionError → whole transaction again, up to 3 times\n| UnknownTransactionCommitResult → commit again
+deactivate DB
+end
+F --> W : deleted 1 | 0 → not_found
+deactivate F
+W --> Ad : { ok: true } | 404 { error: not_found }
+deactivate W
+@enduml
+----
+
+`DELETE /api/account` runs the same facade method for the signed-in user and clears the member cookie. The transaction is the one place the service needs the replica set's transactions (Atlas Free clusters are replica sets; `startSession`, `commitTransaction` and `abortTransaction` are not in Atlas's list of commands unsupported on Free clusters, checked 2026-11-08, and the migrate tool runs one transaction against the real cluster before the first deploy, section 10).
+
+== Service shape
+
+A Cargo workspace, edition 2024, version by hand under `[workspace.package]`, every dependency declared once at the root with the reason beside it, as agent-memory's manifest does.
+
+* `src/traveler`, the service, a library plus a `main.rs`:
+** `main.rs`: install the `aws-lc-rs` rustls provider, read settings, start tracing, build the Tokio runtime by hand, `service::run`.
+** `service.rs`: Mongo `Client` from `ClientOptions::parse` with `server_selection_timeout` 10 s and `connect_timeout` 5 s, one `ping`, the background index check, the `MongoStore`, the `Facade`, the router, the listener on `bind-address`, graceful shutdown on SIGTERM/Ctrl-C.
+** `config.rs`: `Settings` (section 7).
+** `errors.rs`: the codes as `&str` constants and `status_of(code) -> StatusCode`.
+** `activities.rs`: `PREDEFINED`, `PALETTE`, `NAMESPACE`, lookups by id and by name.
+** `model.rs`: the domain and application-state types of sections 2.1 and 2.2, with their constructors.
+** `storage.rs`: the records of section 2.3, the conversions, the `Store` trait and `MongoStore`, index definitions as data (`INDEXES: &[(collection, name, keys, options)]`) that both the migrate tool and the startup check read.
+** `facade.rs`: `Facade<S: Store>` with one method per route of section 3.1; every business decision is here (usability, the cap, the colour, the throttle, the lock, disabled checks). `trait-variant` makes `Store` and the facade's own `AppFacade` trait `Send`; the router is generic over `AppFacade`, so web tests drive it with a fake.
+** `web/mod.rs`: the router, the header middleware, the 404/405 fallbacks, `TraceLayer`; `web/api.rs`, `web/auth.rs` (discovery and JWKS cache in an `RwLock`, the OIDC client), `web/admin.rs`; `web/keys.rs`; `web/cookies.rs` (section 4); `web/extract.rs` (member, admin, CSRF and JSON-body extractors whose `Rejection` is the error envelope); `web/errors.rs`; `web/assets.rs`.
+* `src/traveler-migrate`: the hand-run tool, `indexes`, `check` and `import` (section 9), linking `traveler` as a library for the records and `INDEXES`. Ships in no image.
+
+[cols="1,3"]
+|===
+| Concern | Choice (version in the local registry on 2026-11-08, or docs.rs)
+
+| HTTP | `axum` 0.8 (`/{id}` paths, `method_not_allowed_fallback`), `tower-http` 0.6 with `trace`; `http` 1
+| Runtime | `tokio` 1 (`macros`, `rt-multi-thread`, `signal`, `sync`, `time`)
+| Database | `mongodb` 3 (`default-features = false`, `compat-3-0-0`, `rustls-tls-aws-lc`, `dns-resolver`) and `bson` 2 (`uuid-1`), the pair agent-memory builds; never `bson` 3 beside it
+| Ids | `uuid` 1 (`v4`, `v5`, `serde`)
+| Time | `jiff` 0.2 (`serde`)
+| Errors | `rzlib-error` 0.1 (`json`, `http`)
+| Config | `config` 0.15 (`toml`, `convert-case`)
+| Sign-in | `jsonwebtoken` 11 (`aws_lc_rs`): `decode_header` for `kid`, `jwk::JwkSet` and `DecodingKey::from_jwk`, `Validation` with issuer and audience set, as agent-memory's `core::auth` does; `reqwest` 0.13 (`rustls`, `json`, no default TLS) with a 5 s timeout; `rustls` 0.23 named for the provider install; `url` 2 and `serde_urlencoded` for the redirect and the token form
+| Passwords, tokens | `scrypt` 0.12 (`Params::new(log_n, r, p)`, `scrypt(password, salt, &params, &mut out)`; its `sha2` is 0.11); `hmac` 0.13 with `sha2` 0.11 (both on `digest` 0.11, one copy); `subtle` 2 for constant-time comparison; `rand` 0.9 (`rng()`); `base64` 0.22 (`URL_SAFE_NO_PAD`)
+| Static files | `rust-embed` 8; `mime_guess` 2 for `Content-Type`
+| Logging | `tracing` 0.1, `tracing-subscriber` 0.3 (`env-filter`, `json`) to stdout; no OpenTelemetry here
+| Async traits | `trait-variant` 0.1
+| Tests | `tower` 0.5 (`util`) and `http-body-util` for `oneshot` against the router; `tempfile` for the settings files
+| Lints | every module opens with the agent-memory deny list; `rustfmt.toml` edition 2024, `max_width` 160
+|===
+
+Gates: `cargo build --locked --workspace`, `cargo test --locked --workspace`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo fmt --check`. Every driver call and every `reqwest` call is wrapped in `panic::caught` (copied from agent-memory) and a `tokio::time::timeout`.
+
+Time bound (article 6, bylaw 2): no single wait exceeds 5 s, except Mongo's server selection at 10 s when the cluster is unreachable, which fails every request at once. The longest request is a start that loses the race twice: the usability check, the continue-running update, then 3 attempts × 2 driver calls = 8 waits, 40 s; the callback is 2 identity-provider calls (3 with a JWKS refetch) and 2 driver calls, 25 s. Both are under bylaw 2's 60 s and far under Cloudflare's 100 s.
+
+Tests, by layer: `model` constructors refuse what section 2.1 says; `storage` conversions accept Node-shaped data and refuse every row of the table in section 2.4; `cookies` round-trips, rejects a changed byte, a wrong kind and an expired payload; `keys` both ways; `web` with a fake facade checks every route's status and JSON against the table in section 3.1, the CSRF rule, the fallbacks, the static files and the headers; `facade` with a fake store checks the start sequence and its retry, the cap and the colour, the setup token and the login throttle. `MongoStore` has no in-process test: no `mongod` runs on the workstation, and copying agent-memory's download-and-run sandbox is work the value did not justify (article 11). It is exercised against the real cluster by `traveler-migrate check` (one transaction, and `OneRunning` refusing a second running insert) and by the cutover's smoke test.
+
+== Configuration
+
+`appsettings.toml` ships in the image with defaults only; `appsettings.development.toml` (git-ignored, outside the image) is loaded when `RUST_ENVIRONMENT=development`; the environment overrides both. Keys kebab-case, deserialised with `rename_all = "kebab-case"`; a variable nests with `__` (`MONGO__CONNECTION_STRING` → `mongo.connection-string`), plus a fixed alias table in `config.rs` for the six names Erawan's auth add-on sets, which have one underscore:
+
+[cols="1,1,2"]
+|===
+| Key | Variable | Meaning, default
+
+| `bind-address` | `BIND_ADDRESS` | `0.0.0.0:8080`
+| `mongo.connection-string` | `MONGO__CONNECTION_STRING` | the Atlas URI; required; an Erawan secret
+| `mongo.database` | `MONGO__DATABASE` | `traveler`
+| `session.key` | `SESSION__KEY` | the HMAC key, at least 32 characters; required; an Erawan secret
+| `session.member-days` | | 30
+| `session.admin-hours` | | 12
+| `session.setup-hours` | | 24
+| `session.oidc-minutes` | | 15
+| `auth.issuer-url` | `AUTH_ISSUER_URL` | the Erawan auth add-on; trailing `/` removed
+| `auth.client-id` | `AUTH_CLIENT_ID` |
+| `auth.client-secret` | `AUTH_CLIENT_SECRET` |
+| `auth.jwks-url` | `AUTH_JWKS_URL` | default: the discovery document's `jwks_uri`
+| `auth.well-known-url` | `AUTH_WELLKNOWN_URL` | default `{issuer-url}/.well-known/openid-configuration`
+| `auth.public-url` | `PUBLIC_URL` | builds `redirect_uri` and the setup link; absent: the request's scheme and host, `http://localhost:8080` for the setup link
+| `auth.dev-login` | | `false`; `true` only in `appsettings.development.toml`
+| `logging.level` | `LOGGING__LEVEL` | `info`, an `EnvFilter` directive
+|===
+
+`auth` is configured when issuer, client id and client secret are all set; `/api/config` answers three providers then, none otherwise. `Settings::check()` refuses, by key: a missing `mongo.connection-string`, a `session.key` under 32 characters, an `auth` block with some but not all of the three, and `dev-login` true while `auth` is configured (a production deployment has `auth`; the development overlay has not). Secret fields have a hand-written `Debug` printing `<redacted>`; the Mongo URI is never logged, the driver's own error messages do not include it.
+
+== Deployment on Erawan
+
+* `Dockerfile` at the repository root, so Erawan builds it and detects nothing else. No BuildKit syntax: no `# syntax=` line, no `--mount`, no `COPY --link`. Stages:
+** `build` from `rust:1-slim-bookworm` (agent-memory compiles the same `mongodb` + `aws-lc-rs` + `reqwest` set in `rust:1.96-slim-bookworm` with no extra packages): `COPY` the workspace manifests, the lockfile, `rustfmt.toml`, `src/traveler`, `src/traveler-migrate` (Cargo refuses a workspace with a member missing) and `public/`; `cargo build --release --locked --package traveler`. Dependencies compile on every build; Erawan's build time for this set is unknown until the first deploy.
+** runtime from `debian:bookworm-slim` with `ca-certificates` (Atlas TLS, the identity provider) and `curl` (a shell healthcheck if ever wanted); `/app/traveler`, `/app/appsettings.toml`; `WORKDIR /app`; `EXPOSE 8080`; exec-form `ENTRYPOINT ["/app/traveler"]`.
+** `.dockerignore`: `target/`, `.data/`, `.secrets/`, `appsettings.*.toml`, `docs/`, `.claude/`, `.git/` (the Node entries went with the Node tree after the cutover).
+* `erawan.yaml` at the root:
++
+----
+version: 1
+addons: [auth]
+components:
+  web:
+    path: .
+    port: 8080
+    public: true
+    healthcheck: /healthz
+    secrets: [MONGO__CONNECTION_STRING, SESSION__KEY]
+    resources:
+      requests: {memory: 64Mi, cpu: 50m}
+      limits:   {memory: 256Mi, cpu: 500m}
+----
++
+`postgres` is not declared, so the add-on leaves the app's environment on the deploy that ships this file; it is removed with `erawan addon rm` after the cutover is confirmed. The two secrets are set once in the Erawan console at the address the first deploy prints. Whether Erawan accepts `__` in a secret's name is checked at that deploy; if not, the names fall back to `MONGO_CONNECTION_STRING` and `SESSION_KEY` through the same alias table as `AUTH_*`.
+* The app keeps its name `time-traveler`, so `https://time-traveler.erawan.app`, the auth client and its registered callback stay. The deploy that replaces Node is the cutover; a failed build or a failing `/healthz` leaves Node running.
+* Atlas allows Erawan's egress `110.164.203.237` (Rux, 2026-11-07; the address was the same on two one-off pods). A deploy that cannot reach Atlas fails `/healthz` and is rolled back by Erawan; check the egress before anything else.
+* Off Erawan later: the same image runs anywhere with the two secrets and the `AUTH_*` variables set, and the new callback URL registered with `erawan auth callback add`.
+
+== Data migration
+
+Two tools, both run by hand:
+
+* `scripts/export.mjs`, added to the Node tree for the cutover and deleted with it afterwards (its text is reproduced in the `Dump` doc comment of `traveler-migrate`): `erawan run time-traveler -- node scripts/export.mjs` prints one JSON document to stdout, captured to a local file. It selects `users`, `activities`, `time_sessions` and `admins` with every column, timestamps as ISO strings, and nothing from `auth_sessions`, `admin_sessions`, `admin_setup_tokens` or `oidc_requests`.
+* `traveler-migrate`, run from a workstation on Atlas's allow list with the same two secrets in its environment:
+** `indexes`: creates every entry of `storage::INDEXES`, idempotent (`createIndexes` with the same name and keys is a no-op; a changed definition is reported, not replaced).
+** `check`: runs one empty transaction (start, a `findOne` in it, commit) and inserts then deletes two documents against `OneRunning` to prove the cluster supports what section 5 relies on, then runs the continue-running update on a throwaway session (same activity with a target, another activity, a target past the limit, no target), whose arithmetic happens in the server; reports the outcome.
+** `import <dump.json>`: converts every row through the table below into a record, through `TryFrom` into the domain and back, refuses the whole dump when any row is refused (listing each by table and id), refuses a database that already holds a `User` or an `Admin`, then inserts.
+
+[cols="1,2"]
+|===
+| Postgres row | Document
+
+| `users` | `User`: `_id` = `id`; `Identities: [{ Issuer: AUTH_ISSUER_URL, Subject: oidc_sub }]`, or `{ Issuer: "dev", Subject: "local" }` for `oidc_sub = 'dev:local'`; `Email`, `Name`, `DisabledAt` when not null; `CreatedAt`; `UpdatedAt = created_at`; `hidden_builtins` dropped
+| `activities` | `Activity`: `_id`, `UserId`, `Name`, `Color`, `CreatedAt`, `DeletedAt` when not null
+| `time_sessions` | `TimeSession`: `_id`, `UserId`, `ActivityId` = the `PREDEFINED` id for a predefined name, the UUID after `c:` otherwise (a key of neither form is a refused row), `StartedAt`, `EndedAt` when not null else `Running: true`, `TargetSeconds` when not null
+| `admins` | `Admin`: `_id`, `Username`, `PasswordHash`, `CreatedAt`, `UpdatedAt = created_at`
+|===
+
+Cutover, in order: `indexes`; `check`; export; `import`; deploy the Rust image under the same name; sign in, open today, check `/api/state` and the admin list; `erawan addon rm` for `postgres`. Members and the admin sign in again; a running session at export time is imported running.
+
+Done on 2026-11-09: the export ran as the same script inlined through `erawan run time-traveler -- node -e` (base64-encoded, so no Node redeploy was needed), yielding 2 users, 0 custom activities, 103 sessions (1 running) and 1 admin; `import` refused no row; version 19 built from the Dockerfile and went live; Rux signed in and confirmed the data; the `postgres` add-on was removed.
+
+== Verified, unverified, open
+
+Verified on 2026-11-08:
+
+* Every route, status, code and JSON shape in section 3 against `src/api.js`, `src/auth.js`, `src/admin.js`, `src/server.js`, `src/activities.js`, and every call in `public/app.js` and `public/admin/admin.js`.
+* The identity provider's discovery document: endpoints, `RS256`, `client_secret_post`, `S256`, claims.
+* Crate versions and the APIs named in section 6, from the local cargo registry and docs.rs: `scrypt` 0.12 `Params::new(log_n, r, p)` and `scrypt(..., &mut out)`; `hmac` 0.13 on `digest` 0.11 with `sha2` 0.11; `bson` 2 `uuid_1_as_binary` under `uuid-1`; `mongodb` 3 `ClientSession` with `start_transaction`, `commit_transaction` and the `TransientTransactionError` / `UnknownTransactionCommitResult` labels; `jsonwebtoken` 11 `JwkSet` + `from_jwk` as agent-memory uses it.
+* `partialFilterExpression` accepts equality and `$exists: true`, not `$exists: false` (MongoDB manual), hence `Running: true`.
+* Atlas Free cluster limits and the list of unsupported commands: transactions and `findAndModify` are not listed as unsupported.
+* Erawan's manifest keys and gate findings, from the installed skill's playbook: `healthcheck`, `secrets`, `resources`, the `cookie-scope` and `env-file` gates, Dockerfile detection first.
+
+Not verified until the step named:
+
+* Verified 2026-11-09 against the real cluster with a working credential: `traveler-migrate indexes` created the five indexes, `check` ran a transaction and saw `OneRunning` refuse a second running insert, and the service run locally against Atlas passed a smoke test of every member route (sign-in, state, start, switch, list, create activity, stop, delete account) and served the frontend with the hide toggle gone.
+* Verified 2026-11-10 against the real cluster: `check` ran the continue-running update of section 5 (the pipeline with `$subtract`, `$trunc`, `$toInt`, `$max`, `$add`) and saw the session kept with a target of about 700 s, another activity and a target past the limit not matching, and no target clearing it.
+* That Erawan's builder accepts the multi-stage Dockerfile, within its build time, and `__` in secret names: the first deploy.
+* The id_token's actual claims (`email`, `name` present or not): the first real sign-in; the code handles both.
+
+Open:
+
+* The setup token and the login throttle are in memory, so a second instance would share neither; the service is one instance by decision.
+* The hide-toggle removal is the only frontend change; the rest of `public/` is untouched and was read only for what it sends and reads.

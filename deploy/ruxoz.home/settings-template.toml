@@ -1,0 +1,17 @@
+# The keys of /data/apps/time-traveler/appsettings.production.toml on ruxoz.home: root-owned, mode 600, no ACL.
+# Never commit the filled file. Values: the Atlas URI from .secrets/mongo-uri.txt, a new random session key, and the
+# auth values the Erawan app `time-traveler` holds (its client stays the identity provider's client).
+
+[mongo]
+connection-string = ""   # the Atlas URI
+
+[session]
+key = ""                 # 32+ random characters; a new key signs everyone out once
+
+[auth]
+issuer-url     = ""      # AUTH_ISSUER_URL
+client-id      = ""      # AUTH_CLIENT_ID
+client-secret  = ""      # AUTH_CLIENT_SECRET
+jwks-url       = ""      # AUTH_JWKS_URL
+well-known-url = ""      # AUTH_WELLKNOWN_URL
+public-url     = "https://time-traveler.ruxoz.net"
